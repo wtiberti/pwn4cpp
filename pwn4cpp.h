@@ -12,6 +12,10 @@
 #include <stdexcept>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <sys/types.h>
+#include <netdb.h>
+
+#include <cstring>
 
 using std::string_literals::operator""s;
 
@@ -35,7 +39,7 @@ void print_error(const std::string &str)
 void print_info(const std::string &str)
 {
 #ifdef DEBUG
-	std::cerr << "[*] "s + str << std::endl;
+	std::cerr << "\x1b[93m[*] "s + str + "\x1b[0m"<< std::endl;
 #endif
 }
 
@@ -60,6 +64,8 @@ private:
 	uint16_t _port;
 	int _socket = -1;
 
+	bytes buffer;
+
 	void do_close()
 	{
 		if (_socket != -1) {
@@ -82,14 +88,31 @@ public:
 			do_close();
 			return;
 		}
-		if (resolve_dns) {
-			// TODO : DNS resolution
-		}
+
 		sockaddr_in sin;
-		sin.sin_family = AF_INET;
-		sin.sin_port = htons(_port);
-		if (inet_pton(AF_INET, _host.c_str(), (sockaddr *) &(sin.sin_addr)) < 1)
-			throw std::runtime_error("Invalid host");
+
+		if (resolve_dns) {
+			bool found = false;
+			addrinfo *ai;
+			getaddrinfo(_host.c_str(), std::to_string(_port).c_str(), nullptr, &ai);
+			addrinfo *cur = ai;
+			while (cur != nullptr) {
+				if ((cur->ai_family == AF_INET) && (cur->ai_socktype == SOCK_STREAM)) {
+					sin = *(sockaddr_in*)(cur->ai_addr);
+					found = true;
+					break;
+				}
+				cur = cur->ai_next;
+			}
+			freeaddrinfo(ai);
+			if (! found)
+				throw std::runtime_error("Host not found");
+		} else {
+			sin.sin_family = AF_INET;
+			sin.sin_port = htons(_port);
+			if (inet_pton(AF_INET, _host.c_str(), (sockaddr *) &(sin.sin_addr)) < 1)
+				throw std::runtime_error("Invalid address");
+		}
 		if (connect(_socket, (sockaddr *)&sin, sizeof(sockaddr_in)) != 0) {
 			print_error("Unable to connect");
 			do_close();
@@ -101,18 +124,32 @@ public:
 
 	bytes recv(size_t buffersize=2048)
 	{
+		int flags = 0;
 		if (! _connected)
 			throw std::runtime_error("Not connected");
+		size_t old_buffer_size = buffer.size();
+		if (old_buffer_size > 0) {
+			bytes result(buffer);
+			buffer.clear();
+			flags = MSG_DONTWAIT;
+			//return result;
+		}
 		bytes result;
-		result.resize(buffersize);
-		int recv_result = ::recv(_socket, result.data(), buffersize, 0);
+		result.resize(old_buffer_size + buffersize);
+		int recv_result = ::recv(_socket, result.data()+old_buffer_size, buffersize, flags);
 		if (recv_result == 0) {
 			print_warning("Peer has closed the connection");
 			do_close();
 		} else if (recv_result < 0) {
-			throw std::runtime_error("Recv error");
+			if (flags != MSG_DONTWAIT && recv_result != -EWOULDBLOCK)
+				throw std::runtime_error(strerror(recv_result));
+			else {
+				print_info("Would block!");
+				recv_result = old_buffer_size;
+			}
 		}
 		print_success("Received "s + std::to_string(recv_result) + " byte/s");
+		print_info("Received "s + bytes2str(result));
 		result.resize(recv_result);
 		return result;
 	}
@@ -122,6 +159,42 @@ public:
 		return bytes2str(recv(buffersize));
 	}
 
+	std::string recv_after(const std::string &needle, size_t buffersize=2048) 
+	{
+		std::string current;
+		// TODO: check edge cases
+		while (true) {
+			do {
+				current += recvstr(buffersize);
+			} while (current.size() == buffersize);
+			size_t pos = current.find(needle, 0);
+			if (pos != std::string::npos) {
+				return current.substr(pos + needle.size());
+			}
+		}
+	}
+
+	std::string recv_until(const std::string &needle, size_t buffersize=2048)
+	{
+		std::string result;
+		// TODO: check edge cases
+		while (true) {
+			std::string current = recvstr(buffersize);
+			size_t pos = current.find(needle, 0);
+			if (pos != std::string::npos) {
+				//result += current.substr(0, pos + needle.size());
+				result += current.substr(0, pos);
+				//bytes temp = str2bytes(current.substr(pos + needle.size()));
+				bytes temp = str2bytes(current.substr(pos));
+				buffer.insert(buffer.end(), temp.begin(), temp.end());
+				break;
+			} else {
+				result += current;
+			}
+		}
+		return result;
+	}
+			
 	int send(const bytes &data)
 	{
 		if (! _connected)
@@ -138,6 +211,11 @@ public:
 		return send(str2bytes(str));
 	}
 
+	int sendline(const std::string &str)
+	{
+		return send(str2bytes(str + '\n'));
+	}
+
 	~Remote()
 	{
 		do_close();
@@ -151,10 +229,9 @@ public:
 
 		std::string r;
 		while (true) {
-			std::getline(std::cin, r, '\x04');
-			//r += '\x0a'; // TODO
+			std::getline(std::cin, r);
 			try {
-				send(r);
+				sendline(r);
 			} catch (...) {
 				break;
 			}
